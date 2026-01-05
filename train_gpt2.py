@@ -15,6 +15,26 @@ class GPTConfig:
 
 
 
+
+# SINGLE HEAD SELF-ATTENTION EXAMPLE
+#
+# hs = 16 
+# key = nn.Linear(C, head_size, bias=false)
+# query = nn.Linear(C, head_size, bias=false)
+# value = nn.Linear(C, head_size, bias=false)
+#
+# k = key(x)
+# q = query(x)
+# v = value(x)
+#
+# weights = q @ k.transpose(-2, -1)   # (B, T, 16) @ (B, 16, T) ---> (B, T, T)  
+#
+# tril = torch.tril(torch.ones(T, T))
+# weights = weights.masked_fill(tril == 0, float('-inf'))
+# weights = F.softmax(weights, dim=1)
+#
+# out = weights @ v
+
 class CasualSelfAttention(nn.Module):
 
   def __init__(self, config):
@@ -24,14 +44,14 @@ class CasualSelfAttention(nn.Module):
     self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
 
     # Output projection
-    self.proj = nn.Linear(config.n_embd, config.n_embd)
+    self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
     # regularization
     self.n_head = config.n_head
     self.n_embd = config.n_embd
 
-    # not really a 'bias', more like a mask, but following the OpenAI/HP naming thought
-    self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)) .view(1, 1, config.block_size, config.block_size))
+    # not really a 'bias', more like a mask, but following the OpenAI/HF naming thought
+    self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
   def forward(self, x):
     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -44,15 +64,17 @@ class CasualSelfAttention(nn.Module):
     q = q.view(B, T, self.head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     v = v.view(B, T, self.head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) 
 
-    # attention (materializes thr large (T,T) matrix for all the queries and keys)
+    # attention (materializes the large (T,T) matrix for all the queries and keys)
     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-    # autoregressive mask, tokens only attend to token before them and never to token in the futire
+    # upper tringular masking
+    # autoregressive mask, tokens only attend to token before them and never to token in the future
     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
     att = F.softmax(att, dim = -1)
-    y = att @ v # (B, nh, T, T) x (B, nh, T, T) -> (B, nh, T, hs)
-    y = y.transpose(1, 2).contiguous().view(B, T, C)
 
+    y = att @ v # (B, nh, T, T) x (B, nh, T, T) -> (B, nh, T, hs)
+    y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+ 
     # output projection
     y = self.c_proj(y)
     return y
@@ -96,7 +118,7 @@ class GPT(nn.Module):
     self.config = config
 
     self.transformer = nn.ModuleDict(dict(
-      # Input embedding
+      # Token embedding
       wte = nn.Embedding(config.vocab_size, config.n_embd),
 
       # positional encoding
@@ -107,7 +129,7 @@ class GPT(nn.Module):
 
        # Final layer present only in the GPT-2 model
       ln_f = nn.LayerNorm(config.n_embd),
-    ))
+    )) 
 
     # Final linear layer
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
