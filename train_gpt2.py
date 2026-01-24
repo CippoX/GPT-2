@@ -13,7 +13,6 @@ class GPTConfig:
   n_head: int = 12 # number of heads
   n_embd: int = 768 # embedding dimension
 
-
 # SINGLE HEAD SELF-ATTENTION EXAMPLE
 #
 # key = nn.Linear(C, hs, bias=false)
@@ -49,6 +48,7 @@ class CasualSelfAttention(nn.Module):
 
     # not really a 'bias', more like a mask, but following the OpenAI/HF naming thought
     self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+
 
   def forward(self, x):
     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -122,14 +122,14 @@ class GPT(nn.Module):
       ln_f = nn.LayerNorm(config.n_embd),       # Final layer present only in the GPT-2 model
     )) 
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)    # Final linear layer
+    
 
-
-  def forward(self, idx): # idx = token indices
+  def forward(self, idx, targets=None): # idx = token indices
     # idx is of shape (B, T)
     B, T = idx.size()
     assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
     # forward the token and position embedding
-    pos = torch.arrange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
     pos_emb = self.transformer.wpe(pos) # position 
     tok_emb = self.transformer.wte(idx)
     x = tok_emb + pos_emb
@@ -141,11 +141,13 @@ class GPT(nn.Module):
     # forward the final layernorm and classifier
     x = self.transformer.ln_f(x)
     logits = self.lm_head(x) # (B, T, vocab_size)
-    return logits
+
+    loss = None
+    if targets is not None:
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    return logits, loss
 
                         
-
-
 
   @classmethod
   def from_pretrained(cls, model_type):
@@ -198,5 +200,69 @@ class GPT(nn.Module):
 
 #--------------------------------------------------------
 
-model = GPT.from_pretrained('gpt2')
-print("didn't crash!")
+device = 'cpu'
+if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+  device = "mps"
+print(f"Using device {device}")
+device = 'cpu' #OVERRIDE
+
+
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+  text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+
+# get logits
+model = GPT(GPTConfig)
+# model.eval()    # put in eval when just using and not training
+model.to(device)
+logits, loss = model(x, y)
+
+print(loss)
+import sys; sys.exit(0)
+
+
+
+model.eval() 
+num_return_sequences = 5
+max_lenght = 30
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
+
+# Generate! right now x is (B, T) = (5, 8)
+torch.manual_seed(42)
+torch.mps.manual_seed(42)
+
+while x.size(1) < max_lenght:
+  with torch.no_grad():
+    logits = model(x) # (B, T, vocab_size)
+    # take the logits at last position
+    logits = logits[:, -1, :]
+    # get probabilities
+    probs = F.softmax(logits, dim=-1)
+    # do top-k sampling of 50 
+    # topk_probs here become (5, 50)
+    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    # select a token from the top-k probabilities
+    ix = torch.multinomial(topk_probs, 1) # (B, 1)
+    # gather the corresponding token
+    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+    # append to the sequence
+    x = torch.cat((x, xcol), dim=1)
+
+
+for i in range(num_return_sequences):
+  tokens = x[i, :max_lenght].tolist()
+  decoded = enc.decode(tokens)
+  print(">", decoded)
+
