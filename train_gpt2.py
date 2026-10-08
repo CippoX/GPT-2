@@ -32,7 +32,6 @@ class GPTConfig:
 # out = weights @ v
 
 class CasualSelfAttention(nn.Module):
-
   def __init__(self, config):
     super().__init__()
     assert config.n_embd % config.n_head == 0 
@@ -50,7 +49,6 @@ class CasualSelfAttention(nn.Module):
     # not really a 'bias', more like a mask, but following the OpenAI/HF naming thought
     self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
-
   def forward(self, x):
     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
     # calculate query, key, values for all heads in batch and move head forward to be the batch
@@ -64,14 +62,16 @@ class CasualSelfAttention(nn.Module):
     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) 
 
     # attention (materializes the large (T,T) matrix for all the queries and keys)
-    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
-
+    # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
     # upper tringular masking
     # autoregressive mask, tokens only attend to token before them and never to token in the future
-    att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-    att = F.softmax(att, dim=-1)
+    # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    # att = F.softmax(att, dim=-1)
+    # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    # Flash Attention
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
     y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
  
     # output projection
@@ -79,8 +79,8 @@ class CasualSelfAttention(nn.Module):
     return y
 
 
-class MLP(nn.Module):
 
+class MLP(nn.Module):
   def __init__(self, config):
     super().__init__()
     self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -95,8 +95,8 @@ class MLP(nn.Module):
     return x
 
 
+
 class Block(nn.Module):
-  
   def __init__(self, config):
     super().__init__()
     # Layer normalization
@@ -109,10 +109,10 @@ class Block(nn.Module):
     x = x + self.attn(self.ln_1(x))
     x = x + self.mlp(self.ln_2(x))
     return x
+
   
 
 class GPT(nn.Module):
-
   def __init__(self, config):
     super().__init__()
     self.config = config
@@ -128,8 +128,6 @@ class GPT(nn.Module):
     self.transformer.wte.weight = self.lm_head.weight # weight sharing scheme
     self.apply(self._init_weights) # init params
 
-
-
   def _init_weights(self, module):
     if isinstance(module, nn.Linear):
       std = 0.02
@@ -140,8 +138,6 @@ class GPT(nn.Module):
         torch.nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    
 
   def forward(self, idx, targets=None): # idx = token indices
     # idx is of shape (B, T)
@@ -264,28 +260,37 @@ torch.manual_seed(1337)
 if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
   torch.mps.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=16, T=1024)
+train_loader = DataLoaderLite(B=4, T=1024)
+
+# For NVIDIA GPUs
+# torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig)
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+if device == "cuda":
+  model = torch.compile(model)
 # model.eval()    # put in eval when just using and not training
 # logits, loss = model(x, y)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
   t0 = time.time()
   x, y = train_loader.next_batch()
   x, y = x.to(device), y.to(device)
   optimizer.zero_grad()
-  logits, loss = model(x, y)
+  with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    logits, loss = model(x, y)
   loss.backward()
+  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)       # Clips the norm to 1, preventing the model from getting too big of a shock in terms of gradints magnitude
+  optimizer.step()
   torch.mps.synchronize()
   t1 = time.time()
-  dt = (t1 - t0) * 1000
-  optimizer.step()
-  print(f"step {i}, loss {loss.item()}, dt: {dt:.2f}ms")
+  dt = t1 - t0
+  tokens_processed = train_loader.B * train_loader.T
+  token_per_sec = tokens_processed / dt
+  print(f"step {i:4d} | loss {loss.item():.6f} | norm:{norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {token_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
